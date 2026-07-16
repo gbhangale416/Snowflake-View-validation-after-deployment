@@ -1,0 +1,173 @@
+# Azure DevOps CI/CD pipeline
+# Stage 1: Deploy Snowflake DDL scripts
+# Stage 2: Identify views impacted by the tables this deployment touched
+# Stage 3: Validate that all views in the account still resolve
+#
+# Prerequisites:
+#   - A Variable Group named "snowflake-secrets" in Pipelines > Library, containing:
+#       SNOWFLAKE_ACCOUNT
+#       SNOWFLAKE_USER
+#       SNOWFLAKE_PASSWORD    (mark as secret; ideally link to Azure Key Vault instead)
+#       SNOWFLAKE_ROLE
+#       SNOWFLAKE_WAREHOUSE
+#       SNOWFLAKE_DATABASES   (optional, comma-separated; blank = scan every database)
+#   - DDL scripts checked into snowflake/ddl/*.sql (applied in filename sort order)
+#   - The connecting role needs IMPORTED PRIVILEGES on the SNOWFLAKE database for
+#     the account_usage lineage lookup in stage 2 (falls back to a text scan if absent)
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - snowflake/ddl/*
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: snowflake-secrets
+
+stages:
+
+  # ---------------------------------------------------------------
+  - stage: DeployDDL
+    displayName: 'Deploy Snowflake DDL'
+    jobs:
+      - job: DeployDDL
+        displayName: 'Run DDL scripts via SnowSQL'
+        steps:
+
+          - checkout: self
+            fetchDepth: 2
+            displayName: 'Checkout (with previous commit for diffing)'
+
+          - script: |
+              set -e
+              git fetch --unshallow || true
+              if git rev-parse HEAD~1 >/dev/null 2>&1; then
+                git diff --name-only HEAD~1 HEAD -- snowflake/ddl/ > changed_ddl_files.txt
+              else
+                echo "No previous commit found; treating all DDL files as deployed"
+                ls snowflake/ddl/*.sql > changed_ddl_files.txt
+              fi
+              echo "Changed DDL files in this deployment:"
+              cat changed_ddl_files.txt
+            displayName: 'Determine changed DDL files'
+
+          - script: |
+              set -e
+              curl -O https://sfc-repo.snowflakecomputing.com/snowsql/bootstrap/1.2/linux_x86_64/snowsql-1.2.28-linux_x86_64.bash
+              SNOWSQL_DEST=$HOME/snowflake SNOWSQL_LOGIN_SHELL=$HOME/.profile bash snowsql-1.2.28-linux_x86_64.bash
+              echo "##vso[task.prependpath]$HOME/snowflake"
+            displayName: 'Install SnowSQL CLI'
+
+          - script: |
+              set -e
+              shopt -s nullglob
+              files=(snowflake/ddl/*.sql)
+              if [ ${#files[@]} -eq 0 ]; then
+                echo "No DDL files found under snowflake/ddl/"
+                exit 1
+              fi
+              for f in "${files[@]}"; do
+                echo "=== Running $f ==="
+                snowsql \
+                  -a "$(SNOWFLAKE_ACCOUNT)" \
+                  -u "$(SNOWFLAKE_USER)" \
+                  -r "$(SNOWFLAKE_ROLE)" \
+                  -w "$(SNOWFLAKE_WAREHOUSE)" \
+                  -f "$f" \
+                  -o exit_on_error=true \
+                  -o friendly=false
+              done
+            displayName: 'Apply DDL scripts'
+            env:
+              SNOWSQL_PWD: $(SNOWFLAKE_PASSWORD)
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.10'
+
+          - script: python scripts/extract_deployed_tables.py changed_ddl_files.txt
+            displayName: 'Extract deployed table names'
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: 'output'
+              artifact: 'deployed-tables'
+            displayName: 'Publish deployed table list'
+
+  # ---------------------------------------------------------------
+  - stage: IdentifyImpactedViews
+    displayName: 'Identify Views Impacted by Deployment'
+    dependsOn: DeployDDL
+    condition: succeeded()
+    jobs:
+      - job: IdentifyImpactedViews
+        displayName: 'Cross-reference views against deployed tables'
+        steps:
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifact: 'deployed-tables'
+              path: '$(Pipeline.Workspace)/deployed-tables'
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.10'
+
+          - script: pip install snowflake-connector-python
+            displayName: 'Install Python dependencies'
+
+          - script: python scripts/find_impacted_views.py "$(Pipeline.Workspace)/deployed-tables/deployed_tables.txt"
+            displayName: 'Find views referencing deployed tables'
+            env:
+              SNOWFLAKE_ACCOUNT: $(SNOWFLAKE_ACCOUNT)
+              SNOWFLAKE_USER: $(SNOWFLAKE_USER)
+              SNOWFLAKE_PASSWORD: $(SNOWFLAKE_PASSWORD)
+              SNOWFLAKE_ROLE: $(SNOWFLAKE_ROLE)
+              SNOWFLAKE_WAREHOUSE: $(SNOWFLAKE_WAREHOUSE)
+              SNOWFLAKE_DATABASES: $(SNOWFLAKE_DATABASES)
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: 'output'
+              artifact: 'impacted-views'
+            displayName: 'Publish impacted views report'
+
+  # ---------------------------------------------------------------
+  - stage: ValidateViews
+    displayName: 'Validate Views'
+    dependsOn: IdentifyImpactedViews
+    condition: succeeded()
+    jobs:
+      - job: ValidateViews
+        displayName: 'Probe every view for resolution errors'
+        steps:
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.10'
+
+          - script: pip install snowflake-connector-python
+            displayName: 'Install Python dependencies'
+
+          - script: python scripts/validate_views.py
+            displayName: 'Validate views (all databases)'
+            env:
+              SNOWFLAKE_ACCOUNT: $(SNOWFLAKE_ACCOUNT)
+              SNOWFLAKE_USER: $(SNOWFLAKE_USER)
+              SNOWFLAKE_PASSWORD: $(SNOWFLAKE_PASSWORD)
+              SNOWFLAKE_ROLE: $(SNOWFLAKE_ROLE)
+              SNOWFLAKE_WAREHOUSE: $(SNOWFLAKE_WAREHOUSE)
+              SNOWFLAKE_DATABASES: $(SNOWFLAKE_DATABASES)
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: 'view_validation_report.csv'
+              artifact: 'view-validation-report'
+            displayName: 'Publish validation report'
