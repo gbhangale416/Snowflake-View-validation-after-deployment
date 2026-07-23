@@ -37,7 +37,7 @@ TABLE_PATTERNS = [
 
 
 # =============================================================================
-# SHARED UTILITIES
+# SHARED UTILITIES & CONNECTION HANDLER
 # =============================================================================
 
 def parse_table_name(name):
@@ -53,6 +53,20 @@ def check_snowsql_pwd():
     if "SNOWSQL_PWD" not in os.environ:
         logger.error("The SNOWSQL_PWD environment variable has not been defined")
         sys.exit(2)
+
+
+def get_snowflake_connection():
+    """Establishes and returns a Snowflake connection using environment variables."""
+    snowflake_connection = snowflake.connector.connect(
+        user=os.environ["SNOWFLAKE_USER"],
+        account=os.environ["SNOWFLAKE_ACCOUNT"],
+        role=os.environ["SNOWFLAKE_ROLE"],
+        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
+        database=os.environ["SNOWFLAKE_DATABASE"],
+        authenticator=os.environ["SNOWFLAKE_AUTHENTICATOR"],
+        password=os.environ["SNOWSQL_PWD"]
+    )
+    return snowflake_connection
 
 
 # =============================================================================
@@ -289,14 +303,16 @@ def main():
     args = parse_args()
     check_snowsql_pwd()
 
-    conn = snowflake.connector.connect(
-        account=args.snowflake_account,
-        user=args.snowflake_user,
-        password=os.environ["SNOWSQL_PWD"],
-        role=args.snowflake_role,
-        warehouse=args.snowflake_warehouse,
-        database=args.snowflake_database,
-    )
+    # Populate standard environment variables expected by get_snowflake_connection()
+    os.environ["SNOWFLAKE_ACCOUNT"] = args.snowflake_account
+    os.environ["SNOWFLAKE_USER"] = args.snowflake_user
+    os.environ["SNOWFLAKE_ROLE"] = args.snowflake_role
+    os.environ["SNOWFLAKE_WAREHOUSE"] = args.snowflake_warehouse
+    os.environ["SNOWFLAKE_DATABASE"] = args.snowflake_database
+    os.environ["SNOWFLAKE_AUTHENTICATOR"] = 'snowflake'
+
+    logger.info("Getting Snowflake Connection via get_snowflake_connection()")
+    conn = get_snowflake_connection()
     cs = conn.cursor()
 
     try:
@@ -307,6 +323,7 @@ def main():
         run_validate_views(cs, args, deployed_tables)
     finally:
         cs.close()
+        logger.info("Closing Snowflake Connection")
         conn.close()
 
 

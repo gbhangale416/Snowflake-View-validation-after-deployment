@@ -1,0 +1,312 @@
+# coEDW Analytics pipeline
+# STAGE 1 (DeployDDL): deploys Snowflake DDL via snowdeploy.py, then --
+#   while still on the same agent that ran the deploy -- extracts which
+#   tables were touched by this build and publishes that as a small JSON
+#   artifact ('deploy-manifest'). This stage's own success/fail is
+#   entirely about the deployment; it has no dependency on validation.
+# STAGE 2 (ValidateViews): a deployment job tied to an Azure DevOps
+#   Environment. Runs only if STAGE 1 succeeded. Automatically downloads
+#   the 'deploy-manifest' artifact, and for each deployed database runs 
+#   the unified deploy_validator.py to find + validate every view 
+#   referencing the touched tables in memory and generate a CSV report.
+
+trigger: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: coEDW_Analytics_lib
+
+name: coedw_pipeline_$(date:yyyyMMdd)$(rev:.r)
+
+parameters:
+- name: target_environment
+  displayName: Environment
+  type: string
+  default: DEV_TEST
+  values:
+  - DEV_TEST
+  - PROD
+  - PREPROD
+- name: apply_post_deployment_steps
+  displayName: Apply Post Deployment Steps? (Apllies to the PROD environment only)
+  type: string
+  default: NO
+  values:
+  - YES
+  - NO
+
+stages:
+
+# =====================================================================
+# STAGE 1: Deploy Snowflake DDL, then record target database metadata
+# =====================================================================
+- stage: DeployDDL
+  displayName: 'Deploy Snowflake DDL'
+  jobs:
+  - job: DeployJob
+    displayName: 'Apply DDL and record target environments'
+    timeoutInMinutes: 600
+
+    steps:
+    - checkout: self
+      persistCredentials: true
+
+    - task: Bash@3
+      displayName: 'Bash - Check git branch and target environment policy'
+      inputs:
+        targetType: 'inline'
+        script: |
+          sudo apt-get install -y jq 
+          echo "Target environment: ${{ parameters.target_environment }}"
+          echo "Selected branch name: $(Build.SourceBranch)"
+
+          CURRENT_BRANCH_NAME=$(echo "$(Build.SourceBranch)" | sed "s/refs\/heads\///")
+          echo "current branch name: $CURRENT_BRANCH_NAME"
+          echo "##vso[task.setvariable variable=CURRENT_BRANCH_NAME]$CURRENT_BRANCH_NAME"
+
+          if [[ "${{ parameters.target_environment }}" == "$(TARGET_ENV_DEV_TEST)" &&  "$CURRENT_BRANCH_NAME" != "$(TEAM_BRANCH_NAME)" ]]; then
+            echo "Target environment ${{ parameters.target_environment }} can be used only with $(TEAM_BRANCH_NAME) branch"
+            exit 1
+          elif [[ "${{ parameters.target_environment }}" == "$(TARGET_ENV_PROD)" &&  "$CURRENT_BRANCH_NAME" != "$(MASTER_BRANCH_NAME)" ]]; then
+            echo "Target environment ${{ parameters.target_environment }} can be used only with $(MASTER_BRANCH_NAME) branch"
+            exit 1
+          elif [[ "${{ parameters.target_environment }}" == "$(TARGET_ENV_UAT)" &&  "$CURRENT_BRANCH_NAME" != "$(UAT_BRANCH_NAME)" ]]; then
+            echo "Target environment ${{ parameters.target_environment }} can be used only with $(UAT_BRANCH_NAME) branch"
+            exit 1 
+          fi
+          
+          echo "Building $CURRENT_BRANCH_NAME against ${{ parameters.target_environment }}"
+
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 3.8'
+      inputs:
+        versionSpec: '3.8' 
+
+    - script: python -m pip install --upgrade pip
+      displayName: 'Upgrade pip'
+
+    - script: az --version
+      displayName: 'Show Azure CLI version'
+
+    - script: az extension add -n azure-devops
+      displayName: 'Install Azure DevOps Extension'
+
+    - script: echo ${AZURE_DEVOPS_CLI_PAT} | az devops login
+      env:
+        AZURE_DEVOPS_CLI_PAT: $(System.AccessToken)
+      displayName: 'Login Azure DevOps Extension'
+
+    - script: az devops configure --defaults organization=$(ORG) project="$(PROJECT)" --use-git-aliases true
+      displayName: 'Set default Azure DevOps organization and project'
+
+    - task: Bash@3
+      displayName: 'Bash - Apply incremental changes to Snowflake'
+      inputs:
+        targetType: 'inline'
+        script: |
+          function run_snowdeploy() {
+            DEPLOY_DB_NAME=$1
+            DEPLOY_WH=$2
+            ROOT_FOLDER=$3
+            SNOWFLAKE_ROLE=$4
+            LAST_SUCCESS_ID=$5
+            CURRENT_HEAD=$6
+            BUILD_STARTED_AT=$7
+            ACCOUNT_LEVEL_FILE=$8
+            DB_ENV=$9
+            REPOSITORY_ID=${10}
+
+            echo "ACCOUNT_LEVEL_FILE: $ACCOUNT_LEVEL_FILE"
+
+            echo "Running Snowdeploy with $DEPLOY_DB_NAME database"
+            echo "with command: python $(PROJECT_FOLDER)/scripts/snowdeploy.py -f $ROOT_FOLDER -a $(SF_ACCOUNTNAME) -u $(SF_USER) -r $SNOWFLAKE_ROLE -w $DEPLOY_WH -d $DEPLOY_DB_NAME -c $(SF_CHANGE_TABLE) -b $(Build.BuildId) -t $BUILD_STARTED_AT -v -ac -pn $(Build.buildNumber) -bi $(SF_BUILD_INFO_TABLE) -lsi $LAST_SUCCESS_ID -ch $CURRENT_HEAD -st $(System.AccessToken) -rid $REPOSITORY_ID -al $ACCOUNT_LEVEL_FILE -de $DB_ENV"
+            python $(PROJECT_FOLDER)/scripts/snowdeploy.py -f $ROOT_FOLDER -a $(SF_ACCOUNTNAME) -u $(SF_USER) -r $SNOWFLAKE_ROLE -w $DEPLOY_WH -d $DEPLOY_DB_NAME -c $(SF_CHANGE_TABLE) -b $(Build.BuildId) -t $BUILD_STARTED_AT -v -ac -pn $(Build.buildNumber) -bi $(SF_BUILD_INFO_TABLE) -lsi $LAST_SUCCESS_ID -ch $CURRENT_HEAD -st $(System.AccessToken) -rid $REPOSITORY_ID -al $ACCOUNT_LEVEL_FILE -de $DB_ENV
+
+            # Record this target (db|warehouse|role) so stage 2 can validate it
+            DEPLOY_TARGETS="${DEPLOY_TARGETS}${DEPLOY_DB_NAME}|${DEPLOY_WH}|${SNOWFLAKE_ROLE};"
+          }
+
+          export BUILD_START_TIME=$(date '+%Y%m%d%H%M%S')
+          echo "Build Start Time: $BUILD_START_TIME"
+
+          echo 'Starting bash task'
+          echo "PROJECT_FOLDER $(PROJECT_FOLDER)"
+
+          INITIAL_COMMIT_ID_GIT=$(git rev-list --all | tail -n 1)
+          echo "INITIAL_COMMIT_ID: $INITIAL_COMMIT_ID_GIT"      
+          export LAST_SUCCESSFUL_BUILD_COMMIT=$(az pipelines build list --branch $(CURRENT_BRANCH_NAME) -o json |jq -r '[.[]|select(.buildNumber|startswith("coedw_pipeline_"))|select(.result == "succeeded")|{sourceVersion: .sourceVersion}]'|jq -r '.[0] .sourceVersion')
+          echo "LAST_SUCCESSFUL_BUILD_COMMIT: $LAST_SUCCESSFUL_BUILD_COMMIT" 
+          if [[ "$LAST_SUCCESSFUL_BUILD_COMMIT" == "null" ]]; then
+            echo "Last successful build commit ID is null, so passing Initial Commit ID from library - $(INITIAL_COMMIT_ID)"
+            LAST_SUCCESSFUL_BUILD_COMMIT=$(INITIAL_COMMIT_ID) 
+          fi        
+          echo "Git commit number from the last successful build of the branch $(CURRENT_BRANCH_NAME): $LAST_SUCCESSFUL_BUILD_COMMIT"
+            
+          CURRENT_GIT_BRANCH_HEAD=$(git rev-parse HEAD)
+          echo "Git commit number from the head of the branch $(CURRENT_BRANCH_NAME): $CURRENT_GIT_BRANCH_HEAD"  
+          
+          pip install --upgrade pip --no-cache-dir
+          pip --version
+          python --version
+          echo 'Installing certifi==2020.12.5'
+          pip install certifi==2020.12.5 --no-cache-dir 2>&1 | grep -v 'A new release of pip is available'
+          echo 'Installing python Snowflake library'
+          pip install --upgrade snowflake-connector-python==3.12.4 --no-cache-dir 2>&1 | grep -v 'A new release of pip is available'
+
+          DEPLOY_TARGETS=""
+          
+          if [[ "${{ parameters.target_environment }}" == "$(TARGET_ENV_DEV_TEST)" ]]; then
+            run_snowdeploy $(COEDW_DB_NAME)$(DEV_DB_POSTFIX)  $(SF_WAREHOUSE)$(DEV_DB_POSTFIX)$(TEST_DB_POSTFIX)    $(PROJECT_FOLDER)      $(SF_ROLE_DEV_TEST)       $LAST_SUCCESSFUL_BUILD_COMMIT          $CURRENT_GIT_BRANCH_HEAD            $BUILD_START_TIME 0   dev    $(REPO_ID)
+            run_snowdeploy $(COEDW_DB_NAME)$(TEST_DB_POSTFIX) $(SF_WAREHOUSE)$(DEV_DB_POSTFIX)$(TEST_DB_POSTFIX)    $(PROJECT_FOLDER)        $(SF_ROLE_DEV_TEST)     $LAST_SUCCESSFUL_BUILD_COMMIT          $CURRENT_GIT_BRANCH_HEAD            $BUILD_START_TIME 0   tst    $(REPO_ID)
+            echo "Done with DEV TEST..............................."
+          
+          elif [[ "${{ parameters.target_environment }}" == "$(TARGET_ENV_UAT)" ]]; then
+            run_snowdeploy $(COEDW_DB_NAME)$(UAT_DB_POSTFIX)   $(SF_WAREHOUSE)                     $(PROJECT_FOLDER) $(SF_ROLE)   $LAST_SUCCESSFUL_BUILD_COMMIT  $CURRENT_GIT_BRANCH_HEAD       $BUILD_START_TIME  0    preprod  $(REPO_ID)
+            echo "Done with UAT(Pre-PROD) ..............................." 
+
+          elif [[ "${{ parameters.target_environment }}" == "$(TARGET_ENV_PROD)" ]]; then
+            run_snowdeploy $(COEDW_DB_NAME)                   $(SF_WAREHOUSE)                                          $(PROJECT_FOLDER)   $(SF_ROLE)  $LAST_SUCCESSFUL_BUILD_COMMIT  $CURRENT_GIT_BRANCH_HEAD         $BUILD_START_TIME  0  prd  $(REPO_ID)
+            echo "Done with PROD ..............................." 
+
+            if [[ "${{ parameters.apply_post_deployment_steps }}" == "YES" ]]; then
+              run_snowdeploy $(COEDW_DB_NAME)                   $(SF_WAREHOUSE)                     $(PROJECT_FOLDER)  $(SF_ROLE)   $LAST_SUCCESSFUL_BUILD_COMMIT   $CURRENT_GIT_BRANCH_HEAD  $BUILD_START_TIME 2  prd   $(REPO_ID)
+              echo "Done with POST PROD DEPLOYMENT ..............................."
+            fi
+          fi
+
+          echo "Deployed targets this build: $DEPLOY_TARGETS"
+          echo "##vso[task.setvariable variable=DEPLOY_TARGETS]$DEPLOY_TARGETS"
+
+        failOnStderr: true      
+      env:
+        SNOWSQL_PWD: $(SF_PASSWORD)
+        PYTHONUNBUFFERED: '1'
+
+    - task: Bash@3
+      displayName: 'Bash - Build deployment targets manifest'
+      inputs:
+        targetType: 'inline'
+        script: |
+          MANIFEST_DIR="$(Build.ArtifactStagingDirectory)/deploy-manifest"
+          mkdir -p "$MANIFEST_DIR"
+
+          if [ -z "$(DEPLOY_TARGETS)" ]; then
+            echo "[]" > "$MANIFEST_DIR/targets.json"
+            echo "No deployment targets recorded - manifest will be empty."
+          else
+            TARGETS_JSON="["
+            FIRST=1
+            IFS=';' read -ra TARGETS <<< "$(DEPLOY_TARGETS)"
+            for target in "${TARGETS[@]}"; do
+              [ -z "$target" ] && continue
+              IFS='|' read -r DEPLOY_DB_NAME DEPLOY_WH SNOWFLAKE_ROLE <<< "$target"
+
+              if [ $FIRST -eq 0 ]; then TARGETS_JSON="${TARGETS_JSON},"; fi
+              TARGETS_JSON="${TARGETS_JSON}{\"database\":\"$DEPLOY_DB_NAME\",\"warehouse\":\"$DEPLOY_WH\",\"role\":\"$SNOWFLAKE_ROLE\"}"
+              FIRST=0
+            done
+            TARGETS_JSON="${TARGETS_JSON}]"
+            echo "$TARGETS_JSON" > "$MANIFEST_DIR/targets.json"
+          fi
+
+          echo "Manifest contents:"
+          cat "$MANIFEST_DIR/targets.json"
+        failOnStderr: true
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish deploy manifest'
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/deploy-manifest'
+        artifact: 'deploy-manifest'
+
+# =====================================================================
+# STAGE 2: Extract tables and validate views in one step
+# =====================================================================
+- stage: ValidateViews
+  displayName: 'Validate Impacted Views'
+  dependsOn: DeployDDL
+  condition: succeeded()
+  jobs:
+  - deployment: ValidateJob
+    displayName: 'Validate views against ${{ parameters.target_environment }}'
+    environment: ${{ parameters.target_environment }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: UsePythonVersion@0
+            displayName: 'Use Python 3.8'
+            inputs:
+              versionSpec: '3.8'
+
+          - script: |
+              pip install --upgrade pip --no-cache-dir
+              pip install --upgrade snowflake-connector-python==3.12.4 --no-cache-dir 2>&1 | grep -v 'A new release of pip is available'
+            displayName: 'Install Python dependencies'
+
+          - task: Bash@3
+            displayName: 'Bash - Extract touched tables & validate views'
+            inputs:
+              targetType: 'inline'
+              script: |
+                MANIFEST_DIR="$(Pipeline.Workspace)/deploy-manifest"
+                MANIFEST_FILE="$MANIFEST_DIR/targets.json"
+                REPORT_DIR="$(Build.ArtifactStagingDirectory)/view-validation-reports"
+                mkdir -p "$REPORT_DIR"
+
+                echo "Manifest downloaded to: $MANIFEST_FILE"
+                cat "$MANIFEST_FILE"
+
+                if [ ! -s "$MANIFEST_FILE" ] || [ "$(cat "$MANIFEST_FILE")" == "[]" ]; then
+                  echo "No deployment targets in manifest - nothing to validate."
+                  exit 0
+                fi
+
+                OVERALL_VALIDATION_STATUS=0
+                COUNT=$(python -c "import json; print(len(json.load(open('$MANIFEST_FILE'))))")
+
+                for i in $(seq 0 $((COUNT - 1))); do
+                  DEPLOY_DB_NAME=$(python -c "import json; print(json.load(open('$MANIFEST_FILE'))[$i]['database'])")
+                  DEPLOY_WH=$(python -c "import json; print(json.load(open('$MANIFEST_FILE'))[$i]['warehouse'])")
+                  SNOWFLAKE_ROLE=$(python -c "import json; print(json.load(open('$MANIFEST_FILE'))[$i]['role'])")
+
+                  echo "=== Running extraction & validation for $DEPLOY_DB_NAME ==="
+                  echo "with command: python $(Build.SourcesDirectory)/$(PROJECT_FOLDER)/scripts/deploy_validator.py -a $(SF_ACCOUNTNAME) -u $(SF_USER) -r $SNOWFLAKE_ROLE -w $DEPLOY_WH -d $DEPLOY_DB_NAME -c $(SF_CHANGE_TABLE) -b $(Build.BuildId) -rf $REPORT_DIR/impacted_views_${DEPLOY_DB_NAME}.csv"
+                  
+                  python -u $(Build.SourcesDirectory)/$(PROJECT_FOLDER)/scripts/deploy_validator.py \
+                    -a $(SF_ACCOUNTNAME) \
+                    -u $(SF_USER) \
+                    -r $SNOWFLAKE_ROLE \
+                    -w $DEPLOY_WH \
+                    -d $DEPLOY_DB_NAME \
+                    -c $(SF_CHANGE_TABLE) \
+                    -b $(Build.BuildId) \
+                    -rf "$REPORT_DIR/impacted_views_${DEPLOY_DB_NAME}.csv"
+
+                  RC=$?
+                  if [ $RC -ne 0 ]; then
+                    echo "##vso[task.logissue type=warning]View validation found issues for $DEPLOY_DB_NAME (build $(Build.BuildId)) - see view-validation-reports artifact"
+                    OVERALL_VALIDATION_STATUS=1
+                  fi
+                done
+
+                if [ $OVERALL_VALIDATION_STATUS -ne 0 ]; then
+                  echo "One or more views failed to resolve after this deployment. Deployment already completed and stands -- marking pipeline as partially succeeded so this gets follow-up without blocking the release."
+                  echo "##vso[task.complete result=SucceededWithIssues;]DONE"
+                else
+                  echo "All impacted views resolved successfully."
+                fi
+            env:
+              SNOWSQL_PWD: $(SF_PASSWORD)
+              PYTHONUNBUFFERED: '1'
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            displayName: 'Publish view validation reports'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/view-validation-reports'
+              artifact: 'view-validation-reports'
