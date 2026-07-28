@@ -185,8 +185,8 @@ def find_impacted_views_cross_db(cs, deployed_database, deployed_tables, target_
     parsed_tables = {full_name: parse_table_name(full_name) for full_name in deployed_tables}
     table_short_names = list({t_name.upper() for _, t_name in parsed_tables.values()})
 
-    # Build regex pattern for excluded database keywords
-    exclude_pattern = f"(?i).*({'|'.join(re.escape(kw) for kw in EXCLUDED_DB_KEYWORDS)}).*"
+    # Build regex pattern for excluded database keywords (POSIX compatible)
+    exclude_pattern = f".*({'|'.join(re.escape(kw) for kw in EXCLUDED_DB_KEYWORDS)}).*"
 
     # Construct parameter placeholders for table names
     table_placeholders = [f"%(tbl_{i})s" for i in range(len(table_short_names))]
@@ -202,7 +202,7 @@ def find_impacted_views_cross_db(cs, deployed_database, deployed_tables, target_
           AND referencing_object_domain = 'VIEW'
           AND UPPER(referenced_database) = UPPER(%(database)s)
           AND UPPER(referenced_object_name) IN ({', '.join(table_placeholders)})
-          AND NOT REGEXP_LIKE(referencing_database, %(exclude_pattern)s)
+          AND NOT REGEXP_LIKE(referencing_database, %(exclude_pattern)s, 'i')
     """
 
     # Add filter for target databases (-vdb) if supplied
