@@ -30,7 +30,6 @@ ORDER BY referencing_database, referencing_schema, referencing_view;
 
 -------------------------------------------------------------------------------------
 
-
 SELECT 
     referencing_database, 
     referencing_schema, 
@@ -49,11 +48,17 @@ WHERE referenced_object_domain = 'TABLE'
       UPPER('TABLE_NAME_2')
   )
   
-  -- Exclude databases containing specific keywords matching Python regex
+  -- Exclude databases containing specific keywords ('i' handles case-insensitivity)
   AND NOT REGEXP_LIKE(
       referencing_database,
-      '(?i).*(DEV|TEST|SANDBOX|PREPROD|CLONE|UAT|COMMON_UTILITY|CONNECTORS_SECRET|CO_AI_AGENTS|DEMO|DROPPED|EVENTS_DB|RBAC_GEN|STREAMLIT_APPS|USER|UTIL).*'
+      '.*(DEV|TEST|SANDBOX|PREPROD|CLONE|UAT|COMMON_UTILITY|CONNECTORS_SECRET|CO_AI_AGENTS|DEMO|DROPPED|EVENTS_DB|RBAC_GEN|STREAMLIT_APPS|USER|UTIL).*',
+      'i'
   )
+
+  -- Optional: Include ONLY if passing specific databases via -vdb CLI argument
+  -- AND UPPER(referencing_database) IN (UPPER('TARGET_DB_1'), UPPER('TARGET_DB_2'))
+;
+
 
   -- Optional: Include ONLY if passing specific databases via -vdb CLI argument
   -- AND UPPER(referencing_database) IN (UPPER('TARGET_DB_1'), UPPER('TARGET_DB_2'))
