@@ -1,8 +1,10 @@
 # coEDW Analytics pipeline
 # STAGE 1 (DeployDDL): Deploys Snowflake DDL via snowdeploy.py.
-# STAGE 2 (ValidateViews): Pauses after Stage 1 success for manual approval 
-#   (configured via Azure DevOps Environment checks) before extracting 
-#   touched tables and validating cross-database views.
+# STAGE 2 (ManualApproval): Pauses after Stage 1 success for manual approval
+#   via ManualValidation@0 before extracting touched tables and validating
+#   cross-database views.
+# STAGE 3 (ValidateViews): Extracts touched tables and validates
+#   cross-database views.
 
 trigger: none
 
@@ -175,11 +177,32 @@ stages:
         PYTHONUNBUFFERED: '1'
 
 # =====================================================================
-# STAGE 2: Extract touched tables and validate views (Requires Approval)
+# STAGE 2: Manual Approval Gate (waits for approval after Stage 1)
+# =====================================================================
+- stage: ManualApproval
+  displayName: 'Manual Approval - Proceed to View Validation'
+  dependsOn: DeployDDL
+  condition: succeeded()
+  jobs:
+  - job: WaitForValidation
+    displayName: 'Wait for approval before validating views'
+    pool: server
+    timeoutInMinutes: 4320   # 3 days to respond; adjust as needed
+    steps:
+    - task: ManualValidation@0
+      timeoutInMinutes: 4320
+      inputs:
+        notifyUsers: |
+          your-approver-email@company.com
+        instructions: 'DDL deployment to ${{ parameters.target_environment }} succeeded. Review and approve to proceed with cross-database view validation.'
+        onTimeout: 'reject'
+
+# =====================================================================
+# STAGE 3: Extract touched tables and validate views
 # =====================================================================
 - stage: ValidateViews
   displayName: 'Validate Impacted Views'
-  dependsOn: DeployDDL
+  dependsOn: ManualApproval
   condition: succeeded()
   jobs:
   - deployment: ValidateJob
