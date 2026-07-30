@@ -1,0 +1,110 @@
+def send_teams_alert(webhook_url, database_name, build_id, results, failed):
+    """Sends a formatted, table-style Adaptive Card report to MS Teams matching the Markdown summary."""
+    if not webhook_url:
+        logger.info("No MS Teams webhook URL provided - skipping webhook alert.")
+        return
+
+    total = len(results)
+    failed_count = len(failed)
+    passed_count = total - failed_count
+
+    # Build table rows using ColumnSets for a clean grid layout
+    table_rows = [
+        # Table Header Row
+        {
+            "type": "ColumnSet",
+            "style": "accent",
+            "bleed": True,
+            "columns": [
+                {"type": "Column", "width": "25", "items": [{"type": "TextBlock", "text": "**Schema.View**", "size": "Small", "weight": "Bolder"}]},
+                {"type": "Column", "width": "15", "items": [{"type": "TextBlock", "text": "**Status**", "size": "Small", "weight": "Bolder"}]},
+                {"type": "Column", "width": "20", "items": [{"type": "TextBlock", "text": "**Category**", "size": "Small", "weight": "Bolder"}]},
+                {"type": "Column", "width": "40", "items": [{"type": "TextBlock", "text": "**Error Details**", "size": "Small", "weight": "Bolder"}]}
+            ]
+        }
+    ]
+
+    # Populate table rows from validation results
+    for v_db, schema, view, sources, status, err, category in results:
+        status_text = "✅ OK" if status == "OK" else "❌ FAILED"
+        status_color = "Good" if status == "OK" else "Attention"
+        clean_err = err.replace("|", "-") if err else "-"
+        
+        # Truncate long error messages so the card stays neat
+        if len(clean_err) > 80:
+            clean_err = clean_err[:77] + "..."
+
+        table_rows.append({
+            "type": "ColumnSet",
+            "separator": True,
+            "columns": [
+                {"type": "Column", "width": "25", "items": [{"type": "TextBlock", "text": f"`{schema}.{view}`", "size": "Small", "wrap": True}]},
+                {"type": "Column", "width": "15", "items": [{"type": "TextBlock", "text": status_text, "size": "Small", "color": status_color}]},
+                {"type": "Column", "width": "20", "items": [{"type": "TextBlock", "text": f"`{category}`", "size": "Small"}]},
+                {"type": "Column", "width": "40", "items": [{"type": "TextBlock", "text": clean_err, "size": "Small", "wrap": True, "isSubtle": True}]}
+            ]
+        })
+
+    # Construct Azure DevOps Build URL
+    org = os.environ.get("SYSTEM_COLLECTIONURI", "")
+    project = os.environ.get("SYSTEM_TEAMPROJECT", "")
+    build_url = f"{org}{project}/_build/results?buildId={build_id}" if org and project else "#"
+
+    # Assemble Full Adaptive Card Payload
+    payload = {
+        "type": "message",
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.2",
+                    "body": [
+                        {
+                            "type": "TextBlock",
+                            "text": "🔍 View Validation Report",
+                            "weight": "Bolder",
+                            "size": "Medium"
+                        },
+                        {
+                            "type": "FactSet",
+                            "facts": [
+                                {"title": "Database:", "value": database_name},
+                                {"title": "Build ID:", "value": str(build_id)},
+                                {"title": "Total Views:", "value": str(total)},
+                                {"title": "Passed:", "value": f"✅ {passed_count}"},
+                                {"title": "Failed:", "value": f"❌ {failed_count}"}
+                            ]
+                        },
+                        {
+                            "type": "Container",
+                            "separator": True,
+                            "items": table_rows
+                        }
+                    ],
+                    "actions": [
+                        {
+                            "type": "Action.OpenUrl",
+                            "title": "View Azure DevOps Build",
+                            "url": build_url
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+    try:
+        req = urllib.request.Request(
+            webhook_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req) as response:
+            if response.status in (200, 202):
+                logger.info("Successfully sent tabular validation report to MS Teams.")
+            else:
+                logger.warning(f"MS Teams webhook responded with status code: {response.status}")
+    except Exception as exc:
+        logger.warning(f"Failed to send MS Teams alert: {exc}")
