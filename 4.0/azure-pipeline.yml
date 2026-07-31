@@ -190,8 +190,8 @@ stages:
     and(
       succeeded(),
       or(
-        eq(parameters.target_environment, 'PROD'),
-        eq(parameters.skip_validation, false)
+        eq('${{ parameters.target_environment }}', 'PROD'),
+        eq(${{ parameters.skip_validation }}, false)
       )
     )
   jobs:
