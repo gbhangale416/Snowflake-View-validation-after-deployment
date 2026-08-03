@@ -127,7 +127,7 @@ def extract_deployed_tables(script_paths):
     Extracts table names touched by CREATE/ALTER/DROP TABLE statements.
     Returns a dictionary mapping table name -> set of script paths that modified it.
     """
-    tables_to_scripts = defaultdict(set)
+    tables_to_scripts = {}
     for path in script_paths:
         if not os.path.exists(path):
             logger.warning(f"{path} not found on disk - skipping")
@@ -137,6 +137,8 @@ def extract_deployed_tables(script_paths):
         for pattern in TABLE_PATTERNS:
             for m in pattern.finditer(content):
                 tbl_name = m.group(1).strip('"').upper()
+                if tbl_name not in tables_to_scripts:
+                    tables_to_scripts[tbl_name] = set()
                 tables_to_scripts[tbl_name].add(path)
     return tables_to_scripts
 
