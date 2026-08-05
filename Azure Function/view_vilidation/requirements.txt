@@ -1,0 +1,3 @@
+azure-functions
+snowflake-connector-python
+azure-storage-blob
