@@ -1,0 +1,14 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureBlobStorageConnectionString": "DefaultEndpointsProtocol=https;AccountName=your_account;AccountKey=your_key;EndpointSuffix=core.windows.net",
+    "TARGET_DATABASES": "FINANCE_DB,SALES_DB,LOGISTICS_DB",
+    "PARALLEL_WORKERS": "10",
+    "SnowflakeServiceUser": "YOUR_SNOWFLAKE_USER",
+    "SnowflakeServicePassword": "YOUR_SNOWFLAKE_PASSWORD",
+    "SnowflakeServiceWarehouse": "WH_GEN1_ELT_C4_XS_DEV_TEST",
+    "authentication_type": "False"
+  }
+}
