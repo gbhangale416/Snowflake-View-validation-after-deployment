@@ -1,12 +1,12 @@
 import os
 import sys
-import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Import required utility functions directly from utility.py
+# Import required utility functions directly from your utility.py file
 from utility import (
     get_snowflake_connection,
+    get_metameta_dict,
     get_entity_key_value
 )
 
@@ -20,19 +20,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def load_master_metameta(file_path: str) -> dict:
-    """Reads the master metameta JSON file from disk."""
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Metameta file not found at path: '{file_path}'")
-
-    logger.info(f"Loading master metameta file: {file_path}")
-    with open(file_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
 def extract_all_db_schema_targets(metadata):
     """
-    Parses the metameta dictionary and extracts real Snowflake DB -> Set of target schemas.
+    Parses metameta dictionary and extracts real Snowflake DB -> Set of target schemas.
     Reads 'destination_database' or 'source_database' per entity.
     """
     db_schema_map = {}
@@ -41,7 +31,7 @@ def extract_all_db_schema_targets(metadata):
     if not isinstance(entities, list):
         entities = [entities]
 
-    # Fall back if no entities array exists
+    # Fallback if no entities array exists
     if not entities:
         top_db = get_entity_key_value("destination_database", None, metadata) or get_entity_key_value("source_database", None, metadata)
         top_schema = get_entity_key_value("destination_schema", None, metadata) or get_entity_key_value("default_source_schema", None, metadata) or ""
@@ -112,7 +102,7 @@ def fetch_views_for_db(target_db, target_schemas):
 
 
 def validate_single_view(view_tuple):
-    """Executes 'SELECT * LIMIT 0' on a single view."""
+    """Executes 'SELECT * LIMIT 0' health check on a single view."""
     v_db, v_schema, v_view = view_tuple
     fq_name = f'"{v_db}"."{v_schema}"."{v_view}"'
 
@@ -133,38 +123,42 @@ def validate_single_view(view_tuple):
 
 def main():
     # -------------------------------------------------------------------------
-    # 1. Local Configuration & Specific File Name
+    # 1. Set environment variables locally (or rely on system env vars)
     # -------------------------------------------------------------------------
-    METAMETA_FILE = "./View_validation_metameta.json"
-    parallel_workers = 10
-
-    # Ensure credentials are present
-    os.environ["SnowflakeServiceUser"] = os.environ.get("SnowflakeServiceUser", "YOUR_USER")
-    os.environ["SnowflakeServicePassword"] = os.environ.get("SnowflakeServicePassword", "YOUR_PASSWORD")
+    os.environ["AzureBlobStorageConnectionString"] = os.environ.get(
+        "AzureBlobStorageConnectionString", 
+        "<YOUR_AZURE_BLOB_STORAGE_CONNECTION_STRING>"
+    )
+    os.environ["SnowflakeServiceUser"] = os.environ.get("SnowflakeServiceUser", "<YOUR_SNOWFLAKE_USER>")
+    os.environ["SnowflakeServicePassword"] = os.environ.get("SnowflakeServicePassword", "<YOUR_SNOWFLAKE_PASSWORD>")
     os.environ["SnowflakeServiceWarehouse"] = os.environ.get("SnowflakeServiceWarehouse", "WH_GEN1_ELT_C4_XS_DEV_TEST")
     os.environ["authentication_type"] = "False"
 
+    parallel_workers = 10
+    file_identifier = "View_validation"  # Calls View_validation/View_validation_metameta.json in blob storage
+
     # -------------------------------------------------------------------------
-    # 2. Parse Real Snowflake Databases & Schemas from View_validation_metameta.json
+    # 2. Fetch metameta file from Azure Blob Storage via get_metameta_dict()
     # -------------------------------------------------------------------------
+    logger.info(f"Downloading '{file_identifier}_metameta.json' from Azure Blob Storage...")
     try:
-        metadata = load_master_metameta(METAMETA_FILE)
+        metadata = get_metameta_dict(db_name=file_identifier)
         all_db_schema_map = extract_all_db_schema_targets(metadata)
     except Exception as exc:
-        logger.error(f"Failed to process '{METAMETA_FILE}': {exc}")
+        logger.error(f"Failed to fetch or parse metameta for '{file_identifier}': {exc}")
         sys.exit(1)
 
     if not all_db_schema_map:
-        logger.error("No valid database targets found inside JSON. Exiting.")
+        logger.error("No valid database targets found inside metameta file. Exiting.")
         sys.exit(1)
 
-    logger.info(f"Targeting {len(all_db_schema_map)} Snowflake DBs: {list(all_db_schema_map.keys())}")
+    logger.info(f"Parsed scope for {len(all_db_schema_map)} Snowflake DB(s): {list(all_db_schema_map.keys())}")
 
     # -------------------------------------------------------------------------
-    # 3. Discover Views Across All Databases Concurrently
+    # 3. Discover views across all target databases in parallel
     # -------------------------------------------------------------------------
     all_views = []
-    logger.info("Discovering views in Snowflake...")
+    logger.info("Discovering views across databases concurrently...")
 
     with ThreadPoolExecutor(max_workers=min(parallel_workers, len(all_db_schema_map))) as executor:
         futures = [
@@ -175,13 +169,13 @@ def main():
             all_views.extend(future.result())
 
     if not all_views:
-        logger.info("No views discovered in target databases.")
+        logger.info("No views discovered across target databases.")
         return
 
-    logger.info(f"Queued {len(all_views)} total view(s) for validation across {parallel_workers} threads...\n")
+    logger.info(f"Queued {len(all_views)} total view(s) for validation across {parallel_workers} worker threads...\n")
 
     # -------------------------------------------------------------------------
-    # 4. Validate All Views Concurrently
+    # 4. Validate all views concurrently
     # -------------------------------------------------------------------------
     results = []
     failed = []
