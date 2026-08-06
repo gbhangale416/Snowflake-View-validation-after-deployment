@@ -1,0 +1,27 @@
+{
+  "pipeline_name": "PL_SNOWFLAKE_VIEW_HEALTHCHECK",
+  "entities": [
+    {
+      "source_entity": "Finance_Views",
+      "destination_database": "FINANCE_DB",
+      "destination_schemas": [
+        "FINANCE_CORE",
+        "REPORTING",
+        "TAX"
+      ]
+    },
+    {
+      "source_entity": "Sales_Views",
+      "destination_database": "SALES_DB",
+      "destination_schemas": [
+        "SALES_ANALYTICS",
+        "CRM"
+      ]
+    },
+    {
+      "source_entity": "Logistics_Views",
+      "destination_database": "LOGISTICS_DB",
+      "destination_schema": "OPERATIONS"
+    }
+  ]
+}
