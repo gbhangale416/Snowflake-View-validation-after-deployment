@@ -24,7 +24,6 @@ def get_thread_snowflake_cursor():
         _thread_local.cursor = cs
         _thread_local.context = ctx
 
-        # Track open connections for clean global teardown
         with _conn_lock:
             _open_connections.append((cs, ctx))
 
@@ -44,10 +43,15 @@ def cleanup_thread_connections():
 
 
 def extract_all_db_schema_targets(metadata):
-    """Parses metameta dictionary and extracts real Snowflake DB -> Set of target schemas."""
+    """
+    Parses metameta dictionary and extracts:
+    1. db_schema_map: DB -> Set of target schemas
+    2. excluded_views_map: DB -> Set of excluded views (per entity)
+    """
     db_schema_map = {}
-    entities = metadata.get("entities", [])
+    excluded_views_map = {}
 
+    entities = metadata.get("entities", [])
     if not isinstance(entities, list):
         entities = [entities]
 
@@ -55,14 +59,20 @@ def extract_all_db_schema_targets(metadata):
         top_db = get_entity_key_value("destination_database", None, metadata) or get_entity_key_value("source_database", None, metadata)
         top_schema = get_entity_key_value("destination_schema", None, metadata) or get_entity_key_value("default_source_schema", None, metadata) or ""
         if top_db:
-            db_schema_map.setdefault(top_db.strip().upper(), set()).add(top_schema.strip().upper())
+            top_db_clean = top_db.strip().upper()
+            db_schema_map.setdefault(top_db_clean, set()).add(top_schema.strip().upper())
+            excluded_views_map.setdefault(top_db_clean, set())
 
     for ent in entities:
         db = get_entity_key_value("destination_database", ent, metadata) or get_entity_key_value("source_database", ent, metadata)
         if not db or not str(db).strip():
             continue
 
-        db = str(db).strip().upper()
+        db_clean = str(db).strip().upper()
+        db_schema_map.setdefault(db_clean, set())
+        excluded_views_map.setdefault(db_clean, set())
+
+        # Target Schemas
         schemas = (
             get_entity_key_value("destination_schemas", ent, metadata)
             or get_entity_key_value("destination_schema", ent, metadata)
@@ -73,37 +83,65 @@ def extract_all_db_schema_targets(metadata):
         if isinstance(schemas, list):
             for s in schemas:
                 if str(s).strip():
-                    db_schema_map.setdefault(db, set()).add(str(s).strip().upper())
+                    db_schema_map[db_clean].add(str(s).strip().upper())
         else:
             if str(schemas).strip():
-                db_schema_map.setdefault(db, set()).add(str(schemas).strip().upper())
+                db_schema_map[db_clean].add(str(schemas).strip().upper())
 
-    return db_schema_map
+        # --- PER-ENTITY VIEW EXCLUSIONS ONLY ---
+        exc_views = ent.get("exclude_views", []) or ent.get("excluded_views", [])
+        if not isinstance(exc_views, list):
+            exc_views = [exc_views]
+
+        for ev in exc_views:
+            if str(ev).strip():
+                excluded_views_map[db_clean].add(str(ev).strip().upper())
+
+    return db_schema_map, excluded_views_map
 
 
-def fetch_views_for_db(target_db, target_schemas):
+def fetch_views_for_db(target_db, target_schemas, excluded_views=None):
     """
     Discovers views using target_db.INFORMATION_SCHEMA.VIEWS
-    filtered directly by target schemas without system schema exclusions.
+    filtered directly by target schemas and per-entity excluded views.
     """
     logging.info(f"Fetching views for Snowflake database: '{target_db}'...")
     views_found = []
     cs, ctx = get_snowflake_connection()
     try:
-        schemas_list = [s for s in target_schemas if s]
+        where_clauses = []
 
+        # 1. Target Schemas IN clause
+        schemas_list = [s for s in target_schemas if s]
         if schemas_list:
             schema_list_str = ", ".join([f"'{s}'" for s in schemas_list])
-            where_clause = f"WHERE TABLE_SCHEMA IN ({schema_list_str})"
-        else:
-            where_clause = ""
+            where_clauses.append(f"TABLE_SCHEMA IN ({schema_list_str})")
+
+        # 2. Excluded Views NOT IN clause
+        if excluded_views:
+            plain_views = []
+            fq_views = []
+            for v in excluded_views:
+                if "." in v:
+                    fq_views.append(f"'{v}'")  # Fully qualified: 'SCHEMA.VIEW'
+                else:
+                    plain_views.append(f"'{v}'")  # Plain: 'VIEW_NAME'
+
+            if plain_views:
+                plain_str = ", ".join(plain_views)
+                where_clauses.append(f"TABLE_NAME NOT IN ({plain_str})")
+            if fq_views:
+                fq_str = ", ".join(fq_views)
+                where_clauses.append(f"(TABLE_SCHEMA || '.' || TABLE_NAME) NOT IN ({fq_str})")
+
+        where_stmt = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
         query = f"""
             SELECT
                 TABLE_SCHEMA,
                 TABLE_NAME
             FROM "{target_db}".INFORMATION_SCHEMA.VIEWS
-            {where_clause};
+            {where_stmt};
         """
 
         cs.execute(query)
@@ -140,25 +178,17 @@ def validate_single_view(view_tuple):
 
 
 def generate_failed_csv_report(failed_results):
-    """
-    Generates a flat CSV report containing ONLY failed views.
-    Format: Database, Schema, View Name, Status, Error Message
-    """
+    """Generates a flat CSV report containing ONLY failed views."""
     output = io.StringIO()
     writer = csv.writer(output, lineterminator='\n')
-
-    # Header
     writer.writerow(["Database", "Schema", "View Name", "Status", "Error Message"])
-
-    # Failed view rows
     for row in failed_results:
         writer.writerow(row)
-
     return output.getvalue()
 
 
-def trigger_email_notification(metameta_name, total_views, passed_cnt, failed_cnt, failed_results=None, db_schema_map=None):
-    """Prepares HTML body with summary, target DB/schema mapping & inline results table, then calls send_email()."""
+def trigger_email_notification(metameta_name, total_views, passed_cnt, failed_cnt, failed_results=None, db_schema_map=None, excluded_views_map=None):
+    """Prepares HTML body with summary, target DB/schema mapping & excluded views table, then calls send_email()."""
     to_env = os.environ.get("NOTIFICATION_EMAIL_TO", "bhangaleg@careoregon.org")
     cc_env = os.environ.get("NOTIFICATION_EMAIL_CC", "")
 
@@ -168,31 +198,38 @@ def trigger_email_notification(metameta_name, total_views, passed_cnt, failed_cn
     is_success = failed_cnt == 0
     subject = f"Snowflake View Validation Report: {metameta_name} - {'PASSED' if is_success else 'FAILED'}"
 
-    # Build Target DB & Schemas Table
+    # Build Target DB & Schemas Table with View Exclusions
     target_db_rows = ""
     if db_schema_map:
         for db_name, schemas_set in db_schema_map.items():
             schemas_str = ", ".join(sorted(schemas_set)) if schemas_set else "<em>All Schemas</em>"
+            
+            # Format View Exclusions
+            exc_views = sorted(excluded_views_map.get(db_name, [])) if excluded_views_map else []
+            exc_str = ", ".join(exc_views) if exc_views else "<em>None</em>"
+
             target_db_rows += f"""
             <tr>
                 <td style="padding: 8px 12px; border: 1px solid #dee2e6; background-color: #fcfcfc;"><b>{db_name}</b></td>
                 <td style="padding: 8px 12px; border: 1px solid #dee2e6;">{schemas_str}</td>
+                <td style="padding: 8px 12px; border: 1px solid #dee2e6; color: #666;">{exc_str}</td>
             </tr>
             """
     else:
         target_db_rows = """
         <tr>
-            <td colspan="2" style="padding: 8px 12px; border: 1px solid #dee2e6; color: #777;">No database mapping available</td>
+            <td colspan="3" style="padding: 8px 12px; border: 1px solid #dee2e6; color: #777;">No database mapping available</td>
         </tr>
         """
 
     target_db_table = f"""
-    <h3>Targeted Databases & Schemas</h3>
-    <table style="border-collapse: collapse; width: 100%; max-width: 650px; font-size: 13px; text-align: left; margin-bottom: 25px; border: 1px solid #dee2e6;">
+    <h3>Targeted Databases & Exclusions</h3>
+    <table style="border-collapse: collapse; width: 100%; max-width: 750px; font-size: 13px; text-align: left; margin-bottom: 25px; border: 1px solid #dee2e6;">
         <thead>
             <tr style="background-color: #343a40; color: #ffffff;">
-                <th style="padding: 8px 12px; border: 1px solid #343a40; width: 35%;">Database</th>
-                <th style="padding: 8px 12px; border: 1px solid #343a40; width: 65%;">Target Schemas</th>
+                <th style="padding: 8px 12px; border: 1px solid #343a40; width: 25%;">Database</th>
+                <th style="padding: 8px 12px; border: 1px solid #343a40; width: 40%;">Target Schemas</th>
+                <th style="padding: 8px 12px; border: 1px solid #343a40; width: 35%;">Excluded Views</th>
             </tr>
         </thead>
         <tbody>
@@ -304,7 +341,6 @@ def trigger_email_notification(metameta_name, total_views, passed_cnt, failed_cn
         </html>
         """
 
-    # Call your send_email function
     send_email(subject=subject, body=html_body, to=to_list, cc=cc_list)
 
 
@@ -331,14 +367,12 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
-        # 2. Retrieve Metadata
+        # 2. Retrieve Metadata & Per-Entity View Exclusions
         try:
             metadata = get_metameta_dict(db_name=metameta_name)
             logging.info(f"Successfully loaded '{metameta_name}' from Azure Blob Storage.")
-            logging.info(f"source_server - {metadata['source_server']}.")
-            logging.info(f"source_warehouse - {metadata['source_warehouse']}.")
-
-            all_db_schema_map = extract_all_db_schema_targets(metadata)
+            
+            all_db_schema_map, excluded_views_map = extract_all_db_schema_targets(metadata)
         except Exception as exc:
             logging.error(f"Failed to fetch metameta file for '{metameta_name}': {exc}")
             return func.HttpResponse(
@@ -354,10 +388,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
-        # 3. View Discovery via INFORMATION_SCHEMA
+        # 3. View Discovery via INFORMATION_SCHEMA with View Exclusions
         all_views = []
         for db, schemas in all_db_schema_map.items():
-            db_views = fetch_views_for_db(db, schemas)
+            db_excluded_views = excluded_views_map.get(db, set())
+            db_views = fetch_views_for_db(db, schemas, db_excluded_views)
             all_views.extend(db_views)
 
         if not all_views:
@@ -372,7 +407,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
-        # 4. Multi-Threaded View Validation with Connection Reuse
+        # 4. Multi-Threaded View Validation
         max_workers = int(os.environ.get("VALIDATION_MAX_WORKERS", "10"))
         logging.info(f"Starting parallel validation for {len(all_views)} views using {max_workers} worker threads...")
 
@@ -395,10 +430,9 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 
         logging.info(f"[SUMMARY] Health Check Complete -> Total: {total_count} | Passed: {passed_count} | Failed: {failed_count}")
 
-        # --- CSV PATH ---
+        # --- CSV Report Generation ---
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"view_validation_{metameta_name}_{timestamp}.csv"
-
         csv_data = generate_failed_csv_report(failed_results)
 
         try:
@@ -409,10 +443,9 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         except Exception as local_file_err:
             logging.warning(f"Unable to write local CSV report copy: {local_file_err}")
 
-        # 5. Construct JSON Response & Trigger Notification
+        # 5. Response & Notifications
         end_time = time.perf_counter()
         execution_time_seconds = round(end_time - start_time, 2)
-        logging.info(f"Total execution finished in {execution_time_seconds} seconds.")
 
         try:
             trigger_email_notification(
@@ -421,7 +454,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 passed_cnt=passed_count,
                 failed_cnt=failed_count,
                 failed_results=failed_results,
-                db_schema_map=all_db_schema_map
+                db_schema_map=all_db_schema_map,
+                excluded_views_map=excluded_views_map
             )
         except Exception as notif_err:
             logging.error(f"[NOTIFICATIONS] Notification dispatch failure: {notif_err}", exc_info=True)
