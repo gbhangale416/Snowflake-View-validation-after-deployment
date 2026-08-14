@@ -6,9 +6,25 @@ from pathlib import Path
 import sqlglot
 from sqlglot import TokenType, exp
 
-# Configure logging
+# Configure logging and suppress internal SQLGlot warning noise
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+logging.getLogger("sqlglot").setLevel(logging.CRITICAL)
+
+# Snowflake modifiers that can sit between CREATE [OR REPLACE] and TABLE
+MODIFIER_KEYWORDS = {
+    "OR",
+    "REPLACE",
+    "TRANSIENT",
+    "TEMPORARY",
+    "TEMP",
+    "VOLATILE",
+    "EXTERNAL",
+    "ICEBERG",
+    "HYBRID",
+    "DYNAMIC",
+    "EVENT",
+}
 
 
 def get_sql_files(target_path) -> list[str]:
@@ -100,7 +116,7 @@ def extract_target_tables_ast(statement: exp.Expression) -> list[dict[str, str]]
 
 
 def extract_target_tables_tokens(content: str, dialect: str = "snowflake") -> list[dict[str, str]]:
-    """Fallback extraction using pure SQLGlot Lexical Tokenizer (0% Regex)."""
+    """Safe fallback extraction using SQLGlot Tokenizer without invalid TokenType attributes."""
     tables = []
     try:
         tokens = sqlglot.tokenize(content, read=dialect)
@@ -118,30 +134,26 @@ def extract_target_tables_tokens(content: str, dialect: str = "snowflake") -> li
         if token.token_type in ddl_triggers:
             j = i + 1
 
-            while j < num_tokens and tokens[j].token_type in {
-                TokenType.OR,
-                TokenType.REPLACE,
-                TokenType.TRANSIENT,
-                TokenType.TEMPORARY,
-                TokenType.VOLATILE,
-                TokenType.EXTERNAL,
-                TokenType.VAR,
-            }:
-                if tokens[j].token_type == TokenType.TABLE or tokens[j].text.upper() == "TABLE":
+            # Safely skip modifiers using string comparison
+            while j < num_tokens:
+                token_text = tokens[j].text.upper()
+                if token_text == "TABLE":
                     break
-                j += 1
+                if token_text in MODIFIER_KEYWORDS:
+                    j += 1
+                else:
+                    break
 
-            if j < num_tokens and (tokens[j].token_type == TokenType.TABLE or tokens[j].text.upper() == "TABLE"):
+            # If we reached the TABLE keyword
+            if j < num_tokens and tokens[j].text.upper() == "TABLE":
                 k = j + 1
 
-                if k < num_tokens and tokens[k].token_type == TokenType.IF:
-                    while k < num_tokens and tokens[k].token_type in {
-                        TokenType.IF,
-                        TokenType.NOT,
-                        TokenType.EXISTS,
-                    }:
+                # Skip IF [NOT] EXISTS clauses
+                if k < num_tokens and tokens[k].text.upper() == "IF":
+                    while k < num_tokens and tokens[k].text.upper() in {"IF", "NOT", "EXISTS"}:
                         k += 1
 
+                # Collect target table identifier tokens (e.g., DB . SCHEMA . TABLE)
                 name_parts = []
                 while k < num_tokens and tokens[k].token_type in {
                     TokenType.VAR,
@@ -161,11 +173,7 @@ def extract_target_tables_tokens(content: str, dialect: str = "snowflake") -> li
 
 
 def extract_deployed_tables(path_or_paths, dialect: str = "snowflake") -> tuple[list[dict[str, str]], dict]:
-    """Extracts target table details and records file processing stats.
-
-    Returns:
-      tuple: (records, stats_dict)
-    """
+    """Extracts target table details and records file processing stats."""
     script_paths = get_sql_files(path_or_paths)
 
     stats = {
@@ -187,7 +195,7 @@ def extract_deployed_tables(path_or_paths, dialect: str = "snowflake") -> tuple[
 
             extracted_in_file = []
 
-            # 1. Try AST parsing
+            # 1. Try AST parsing first
             try:
                 statements = sqlglot.parse(content, read=dialect, error_level=None)
                 for statement in statements:
@@ -196,7 +204,7 @@ def extract_deployed_tables(path_or_paths, dialect: str = "snowflake") -> tuple[
             except Exception:
                 pass
 
-            # 2. Fallback to Tokenizer
+            # 2. Tokenizer Fallback for non-standard/legacy DDL syntax
             if not extracted_in_file and content.strip():
                 extracted_in_file = extract_target_tables_tokens(content, dialect=dialect)
 
@@ -204,7 +212,6 @@ def extract_deployed_tables(path_or_paths, dialect: str = "snowflake") -> tuple[
                 item["script_path"] = path
                 records.append(item)
 
-            # Record success
             stats["successful_files"] += 1
 
         except Exception as exc:
@@ -215,7 +222,7 @@ def extract_deployed_tables(path_or_paths, dialect: str = "snowflake") -> tuple[
 
 
 def create_csv_report(records: list[dict[str, str]], report_file: str) -> None:
-    """Writes Database, Schema, Table Name, FQN, and Script Path to CSV."""
+    """Generates and writes a detailed CSV validation report."""
     output_path = Path(report_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -237,14 +244,14 @@ def create_csv_report(records: list[dict[str, str]], report_file: str) -> None:
                 rec["script_path"],
             ])
 
-    logger.info(f"CSV report created at: {output_path.resolve()}")
+    logger.info(f"CSV report successfully created at: {output_path.resolve()}")
 
 
 # ==============================================================================
 # EXECUTION
 # ==============================================================================
 if __name__ == "__main__":
-    folder_path = r"./path/to/your/sql_folder"
+    folder_path = r"C:\Girishbh\POC\Test_SQL_script"
     csv_report_path = r"./output/deployed_tables_report.csv"
 
     if len(sys.argv) > 1:
@@ -265,7 +272,6 @@ if __name__ == "__main__":
     print(f" Failed Files            : {failed_count}")
     print("=" * 80)
 
-    # Print details if any file failed
     if failed_count > 0:
         print("\n❌ FAILED FILES DETAILS:")
         print("-" * 80)
