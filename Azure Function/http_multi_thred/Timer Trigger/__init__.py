@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import logging
 import os
 import queue
@@ -342,7 +343,6 @@ def trigger_email_notification(metameta_name, total_views, passed_cnt, failed_cn
         </html>
         """
 
-    # Call your send_email function
     send_email(subject=subject, body=html_body, to=to_list, cc=cc_list)
 
 
@@ -358,7 +358,6 @@ def main(mytimer: func.TimerRequest) -> None:
 
     logging.info(f"snowflake_view_validator_multi_thread - Scheduled run started at {utc_timestamp}.")
 
-    # Metameta target configured via Environment Variable (or default)
     metameta_name = os.environ.get("TARGET_METAMETA_NAME", "View_validation")
 
     try:
@@ -437,6 +436,22 @@ def main(mytimer: func.TimerRequest) -> None:
             )
         except Exception as notif_err:
             logging.error(f"[NOTIFICATIONS] Notification dispatch failure: {notif_err}", exc_info=True)
+
+        # 5. Build Response Payload & Output to Logs
+        is_success = failed_count == 0
+        response_payload = {
+            "metameta_name": metameta_name,
+            "status": "PASSED" if is_success else "FAILED",
+            "summary": {
+                "total_views": total_count,
+                "passed": passed_count,
+                "failed": failed_count,
+                "execution_time_seconds": execution_time_seconds,
+            },
+            "failed_views": failed_results,
+        }
+
+        logging.info(f"[EXECUTION_RESULT] Final Run Summary:\n{json.dumps(response_payload, indent=2)}")
 
     except Exception as fatal_error:
         logging.error(f"[CRITICAL] Unhandled top-level exception in scheduled job: {fatal_error}", exc_info=True)
